@@ -51,6 +51,9 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
+        if isinstance(rope_scaling, dict):
+            rope_scaling = None
+
         self.rotary_emb = get_rope(
             self.head_dim, # 每个头的维度
             rotary_dim=self.head_dim, # 每个头的维度

@@ -85,7 +85,7 @@ class BlockManager:
         在prefill阶段执行，只会执行一次
         """
         assert not seq.block_table # 确保seq的block_table为空，即第一次分配blocks
-        hh = -1 # 初始化hash值
+        h = -1 # 初始化hash值
         cache_miss = False # 初始化缓存miss标志
         for i in range(seq.num_blocks): # 遍历seq所需的block数
             token_ids = seq.block(i) # 获取seq当前block的token_ids列表

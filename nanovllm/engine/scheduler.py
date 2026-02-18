@@ -13,7 +13,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs # 最大并行的序列数
         self.max_num_batched_tokens = config.max_num_batched_tokens # 最大总token数
         self.eos = config.eos # 结束符
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size) # kv cache块管理器
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kv_cache_block_size) # kv cache块管理器
         self.waiting: deque[Sequence] = deque() # 等待队列里的seq
         self.running: deque[Sequence] = deque() # 运行队列里的seq
 

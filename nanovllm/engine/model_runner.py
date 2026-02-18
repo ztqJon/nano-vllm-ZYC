@@ -45,7 +45,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank) # 设置当前进程的GPU设备
         default_dtype = torch.get_default_dtype() # 默认数据类型：torch.float32
-        torch.set_default_dtype(hf_config.torch_dtype) # 设置默认数据类型为模型的torch_dtype：bfloat16，用于加载模型
+        torch.set_default_dtype(hf_config.dtype) # 设置默认数据类型为模型的torch_dtype：bfloat16，用于加载模型
         torch.set_default_device("cuda") # 设置默认设备为cuda
 
         # self.model = Qwen3ForCausalLM(hf_config) # 初始化模型
@@ -147,10 +147,10 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"] # 内存峰值
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"] # 当前内存使用情况
         num_kv_heads = hf_config.num_key_value_heads // self.world_size # 每个GPU分配到的的kv头数量
-        assert hf_config.hidden_size // hf_config.num_attention_heads == 0
+        assert hf_config.hidden_size % hf_config.num_attention_heads == 0
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads) # 每个头的维度（这么写的原因是qwen2没有head_dim这个属性）
         # block_bytes：每个kv block占用的字节数 = 单个block存放的token数 * [(k + v) * attn层数 * kv头数 * 每个头的维度] * 数据类型大小
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes # 计算能分配的kv block数量
         assert config.num_kvcache_blocks > 0
         # 分配kv_cache，共num_kvcache_blocks块，《是连续的！！！》
