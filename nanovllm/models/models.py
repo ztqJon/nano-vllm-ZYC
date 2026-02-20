@@ -10,5 +10,5 @@ model_dict = {
     "qwen2": Qwen2ForCausalLM,
     "qwen3": Qwen3ForCausalLM,
     "qwen3_moe": Qwen3MoeForCausalLM,
-    "cpm4": Cpm4ForCausalLM
+    "minicpm": Cpm4ForCausalLM
 }

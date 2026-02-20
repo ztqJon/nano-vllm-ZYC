@@ -11,6 +11,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 from nanovllm import LLM, SamplingParams
+_STRIP_MARKERS = (
+    "<|im_end|>",
+    "<|im_start|>",
+    "<|endoftext|>",
+)
+
+
+def sanitize_text(text: str) -> str:
+    cleaned = text
+    for marker in _STRIP_MARKERS:
+        cleaned = cleaned.replace(marker, "")
+    return cleaned.strip()
 
 
 def create_app(llm: LLM) -> FastAPI:
@@ -110,7 +122,7 @@ def create_app(llm: LLM) -> FastAPI:
                 accumulated: List[int] = []
                 for token_id in completion_token_ids:
                     accumulated.append(token_id)
-                    piece = llm.tokenizer.decode([token_id], skip_special_tokens=True)
+                    piece = sanitize_text(llm.tokenizer.decode([token_id], skip_special_tokens=True))
                     if piece:
                         chunk = {
                             "id": completion_id,
@@ -156,7 +168,7 @@ def create_app(llm: LLM) -> FastAPI:
         choices = []
         for i in range(n):
             item = outputs[i]
-            text = item["text"]
+            text = sanitize_text(item["text"])
             completion_tokens = len(item["token_ids"]) if "token_ids" in item else 0
             choice = {
                 "index": i,
@@ -190,15 +202,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, required=True, help="Path to the HF model directory")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--enable-chunked-prefill", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--enforce-eager", action="store_true")
-    parser.add_argument("--speculative-model", type=str, default=None)
-    parser.add_argument("--num-speculative-tokens", type=int, default=0)
-
     return parser.parse_args()
 
 
@@ -207,15 +214,10 @@ def main() -> None:
 
     engine_kwargs: Dict[str, Any] = {
         "tensor_parallel_size": args.tensor_parallel_size,
-        "enable_chunked_prefill": args.enable_chunked_prefill,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": args.enforce_eager,
     }
-    if args.speculative_model:
-        engine_kwargs["speculative_model"] = args.speculative_model
-        engine_kwargs["num_speculative_tokens"] = args.num_speculative_tokens
-
     llm = LLM(args.model, **engine_kwargs)
 
     app = create_app(llm)
