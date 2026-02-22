@@ -20,21 +20,21 @@ def store_kvcache_kernel(
     D: tl.constexpr,
 ):
     """每个线程处理一个token的key和value，将它们存储到kv cache中"""
-    idx = tl.program_id(0) # 获取线程id
-    slot = tl.load(slot_mapping_ptr + idx) # 从 slot_mapping 读取该 token 的 cache 位置
+    idx = tl.program_id(0) # 获取线程idx，也就是第idx个token
+    slot = tl.load(slot_mapping_ptr + idx) # 从 slot_mapping 读取第idx个token的cache位置
     if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D) # 计算 key / value 在内存中的偏移量
+    key_offsets = idx * key_stride + tl.arange(0, D) # 计算这个token的KV在输入key/value张量中的一段连续地址
     value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
+    key = tl.load(key_ptr + key_offsets) #  从输入（还没存到KV cache里的KV）里把该token的KV向量读出来
     value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
+    cache_offsets = slot * D + tl.arange(0, D) # 计算它在KV cache中的目标地址
+    tl.store(k_cache_ptr + cache_offsets, key) # 把KV存到KV cache
     tl.store(v_cache_ptr + cache_offsets, value)
 
 
 def store_kvcache(
-    key: torch.Tensor, # 当前token的key和value
-    value: torch.Tensor,
+    key: torch.Tensor, # 所有待处理token的key和value
+    value: torch.Tensor, # (N, num_heads, head_dim)
     k_cache: torch.Tensor, # kv cache的内存地址
     v_cache: torch.Tensor, 
     slot_mapping: torch.Tensor # 当前token在KV cache中的物理位置索引，形状 (N,)
@@ -50,6 +50,8 @@ def store_kvcache(
     assert k_cache.stride(1) == D and v_cache.stride(1) == D # 从一token的k(v) cache移动到下一个token的k(v) cache需要跳过D个元素
     assert slot_mapping.numel() == N # slot_mapping的长度等于N
     # [(N,)]：启动N个线程，每个线程负责一个token
+    # key.stride(0): key跨一个token的步长，等于num_heads * head_dim
+    # value.stride(0): value跨一个token的步长，等于num_heads * head_dim
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -66,12 +68,15 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context() # 获取全局变量，如is_prefill，slot_mapping，block_tables等
         k_cache, v_cache = self.k_cache, self.v_cache
+
+        # 在做attn计算前，先写kv cache!!
+
         if k_cache.numel() and v_cache.numel(): # kv cache有内存才写入
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping) # 将当前 k / v 写入 kv cache
 
         # attn计算
         if context.is_prefill: # prefill
-            if context.block_tables is not None: # prefix cache
+            if context.block_tables is not None: # block_tables不为空，说明存在prefix cache（见model_runner.py - prepare_prefill）
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,

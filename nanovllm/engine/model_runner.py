@@ -163,20 +163,30 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        """为prefix cache准备block表"""
-        max_len = max(len(seq.block_table) for seq in seqs) # 每个seq的block_table长度最大值
+        """
+        为prefix cache准备block表
+        1. 找本 batch 里最长的 block_table 长度 max_len
+        2. 把每条序列的 block_table 右侧补 -1 到 max_len（padding）
+        3. 转成 GPU 上的 int32 tensor，形状大概是 (batch_size, max_len)    
+        """
+        max_len = max(len(seq.block_table) for seq in seqs) # 所有seq中的block_table个数最大值
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs] # 每个seq的block_table长度补齐到最大长度，不足的用-1填充
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) # 将block_tables转换为Tensor
         return block_tables # (seq_num, max_num_blocks)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         """
-        为prefill准备输入数据，用于flash_attn
+        把一批 seq 打平成一次前向要用的张量，同时构造“每个 token 的 KV 写入位置”
+        为prefill准备的输入数据，用于flash_attn
             1 input_ids：所有序列 真正需要计算 的 token id 的拼接后的列表
             2 positions：所有序列 真正需要计算 的 token 在 seq 中的下标的拼接列表
             3 cu_seqlens_q：FlashAttention 专用的“累积长度”数组（Offset 数组）
-                cu_seqlens_q[i] 表示第 i 个序列在拼接后的 input_ids 中的 起始下标
+            cu_seqlens_q[i] 表示第 i 个序列在拼接后的 input_ids 中的 起始下标
             4 cu_seqlens_k：意义同上，针对kv，但包含整个序列的长度（包括已缓存的token）
+            5 因为k与v存在一起，因此只记k的下标即可
+            6 为什么q可以少记录，但k的下标必须都记录？
+                如果有前缀了，q_old就不用参与计算了，但是q_new还得和全部可见上下文的 k（旧的 + 新的）做注意力计算
+            7 注意seq.block_table和block_tables的区别
         """
         input_ids = []
         positions = []
@@ -185,11 +195,13 @@ class ModelRunner:
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
+        slot_mapping = [] # 新增token的物理位置
         block_tables = None
+        
         for seq in seqs:
+            # 此时seq.block_table已分配好（id值）
             seqlen = len(seq) # 当前序列长度
-            input_ids.extend(seq[seq.num_cached_tokens:]) # 去掉当前序列中已经缓存的token后的token_ids
+            input_ids.extend(seq[seq.num_cached_tokens:]) # （去掉当前序列中已经缓存的token）后的token_ids
             positions.extend(list(range(seq.num_cached_tokens, seqlen))) # extend需要计算的token在当前seq里的下标
             seqlen_q = seqlen - seq.num_cached_tokens # 当前序列中需要计算的部分长度
             seqlen_k = seqlen
@@ -200,27 +212,28 @@ class ModelRunner:
             if not seq.block_table: # warmup不需要slot_mapping 构建
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks): # (已使用的block数, 需要的总block数)
-                # 为还没写入 kv cache  的 block 生成逐 token 的物理位置映射
-                start = seq.block_table[i] * self.block_size # 起始索引
+                # 为还没写入 kv cache  的 block 生成逐 token 的物理位置映射，每一块都有一个start和一个end
+                start = seq.block_table[i] * self.block_size # 起始索引，因为prefix cache都是一块一块的，所以start肯定是从某一块的第一个开始
                 if i != seq.num_blocks - 1:
-                    end = start + self.block_size
+                    end = start + self.block_size # 不是最后一个，就一块一块的加
                 else:
                     # 最后一个block可能未填满，用 seq.last_block_num_tokens 精确到实际 token 数
                     end = start + seq.last_block_num_tokens
-                # TODO slot_mapping 是为了什么？
-                slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]: # TODO prefix cache是啥？
-            block_tables = self.prepare_block_tables(seqs) # 为prefix cache准备block表
+                # slot_mapping是每个token的kv cache的物理槽位映射，一个token就是一个slot,
+                slot_mapping.extend(list(range(start, end))) # 给当前seq这段要处理的 token，逐个分配它们在KV cache里的物理槽位 index
+        
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]: # 有前缀需要从KV cache读取，没有就是全新的，只有有seq有前缀缓存，就一起送给attn的kernel
+            block_tables = self.prepare_block_tables(seqs) # 为kernel准备的所有seq的block_table，都是block id值
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True) # 从 CPU 列表构建 Tensor 并异步传输到 GPU
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables) # 设置全局变量，供flash_attn使用
-        return input_ids, positions # 返回input_ids和positions，做前向运算，输出下一token
+        return input_ids, positions # 返回input_ids和positions，做前向运算，输出下一token（也就是prefill完的第一个token）
 
     def prepare_decode(self, seqs: list[Sequence]):
-        """为decode输出做准备"""
+        """为decode输出做准备，用于flash_attn_with_kvcache，不再需要cu_seqlens_q和cu_seqlens_k"""
         input_ids = [] # 每个seq最后一个token_id的列表
         positions = [] # 每个seq最后一个token的位置索引的列表
         slot_mapping = []
@@ -234,7 +247,7 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables(seqs) # 同prepare_prefill，给到kernel前缀的block id值，用于取kv cache
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -283,7 +296,7 @@ class ModelRunner:
         计算logits -> 采样token_id -> 重置kv状态 -> 返回seqs的新生成token_id列表
         """
         # 根据is_prefill标识符为prefill / decode 准备输入数据，返回
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs) # 拿到输入数据，给到run_model
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None # 采样温度
         logits = self.run_model(input_ids, positions, is_prefill) # 模型前向计算，返回logits
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None # 采样token_id，只会用主进程来做，子进程回到loop()下一轮
