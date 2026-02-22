@@ -211,3 +211,53 @@
 **Q**: can_append 为什么看 len(seq) % block_size == 1？
 
 **A**: 实现里用 `len(seq) % block_size == 1` 作为“需要新 block”的判定条件，因此 can_append 只在该条件成立时要求有空闲 block。
+
+## 本轮补充：Prefill / Attention / Slot Mapping
+
+**Q**: `prepare_prefill` 里这段是什么意思？
+```python
+if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+    block_tables = self.prepare_block_tables(seqs)
+```
+
+**A**: 这是在判断当前 batch 是否存在“只算新 q，但要看完整 k/v 上下文”的场景（prefix cache/chunked prefill）。当 `k_total > q_total` 时，说明需要通过 `block_tables` 从 KV cache 读取历史上下文。
+
+**Q**: 为什么只记 `k` 的长度，不单独记 `v`？
+
+**A**: 因为 attention 里 `k` 和 `v` 的有效长度天然一致（同一段上下文）；接口只需要一套 `cu_seqlens_k` 来描述 K/V 的上下文范围。
+
+**Q**: `prepare_block_tables` 是干什么的？
+
+**A**: 把 batch 内每条 `seq.block_table` 打包成统一形状的二维张量（不足补 `-1`），供 FlashAttention kernel 按 block id 去 KV cache 定位历史 token。
+
+**Q**: `block_tables` 和 `seq.block_table` 的关系？
+
+**A**: `seq.block_table` 是单条序列的一维 block id 列表；`block_tables` 是把一批序列的 `block_table` 拼成二维张量后的批量表示。
+
+**Q**: `prepare_prefill` 会分配 KV block 吗？
+
+**A**: 不会。物理 block 的分配在调度阶段（`block_manager.allocate/may_append`）完成；`prepare_prefill` 只读取已分配好的 `seq.block_table` 并构造前向输入与 context。
+
+**Q**: prefill/decode 前向前都会先写 KV cache 吗？
+
+**A**: 是。`Attention.forward` 里在分支判断前会先执行 `store_kvcache(...)`（前提是该层已分配 cache），然后再分别走 prefill/decode 的 attention kernel。
+
+**Q**: Attention 层输入的 q/k/v 只有一个 token 吗？
+
+**A**: 不一定。prefill 常是 `[total_tokens, ...]`（拼接后的多 token），decode 常是每序列一个新 token 组成的 batch（整体也可 >1）。
+
+**Q**: `store_kvcache`/`store_kvcache_kernel` 处理的是多个 token 吗？
+
+**A**: 是。`store_kvcache_kernel[(N,)]` 会启动 N 个并行实例，每个实例处理一个 token 的整段 K/V 向量写入。
+
+**Q**: `store_kvcache_kernel` 里 `slot_mapping_ptr + idx` 是什么意思？
+
+**A**: 它是取 `slot_mapping[idx]` 的地址并读取其值。读出的 `slot` 是该 token 应写入 KV cache 的槽位号，后续再用 `slot * D + offset` 计算实际写入位置。
+
+**Q**: `slot_mapping_ptr` 是 tensor 还是指针？
+
+**A**: Python 侧传入的是 tensor；进入 Triton kernel 后是该 tensor 底层设备内存的指针语义，因此可做 `ptr + idx` 与 `tl.load/tl.store`。
+
+**Q**: `key.stride(0)` / `value.stride(0)` 一般是多少？
+
+**A**: 对形状 `(N, num_heads, head_dim)` 且最后一维连续的布局，通常是 `num_heads * head_dim`，即跨一个 token 的步长等于该 token 的整段向量长度 `D`。
