@@ -3,6 +3,11 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
+    """
+    第一层decoder的input_layernorm，还没有residual，因此走rms_forward，
+    后面的layernorm都有residual了，就走add_rms_forward
+    x + residual 会不停的变成新的residual，相当于没经过一个模块都把新的变化添加到本体上，并成为新的本体，也叫residual
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()

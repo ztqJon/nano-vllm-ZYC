@@ -1,5 +1,5 @@
 import torch
-from torch import nn
+import torch.nn as nn 
 import torch.nn.functional as F
 import torch.distributed as dist
 
@@ -25,9 +25,12 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+    
+    def weight_loader(self, param: nn.Parameter, loaded_weights: torch.Tensor):
+        raise NotImplementedError("Subclasses should implement this method.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError # 提醒子类必须重写
+        raise NotImplementedError("Subclasses should implement this method.") # 提醒子类必须重写
 
 
 class ReplicatedLinear(LinearBase):
